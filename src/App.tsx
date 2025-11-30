@@ -4,6 +4,8 @@ import {
   MarkdownTextSplitter,
   RecursiveCharacterTextSplitter,
 } from "@langchain/textsplitters";
+import salesLetterDoc from "../README.md?url";
+import caseStudiesDoc from "../CASE_STUDIES.md?url";
 import "./App.css";
 
 type ChunkCard = {
@@ -91,6 +93,23 @@ const ARTICLE_INSIGHTS: Insight[] = [
       "Delegate chunking to an LLM agent that can read the doc, pick splitters, and size overlaps per objective.",
     bestFor: "High-value corpora (earnings calls, compliance docs) where bespoke chunks justify latency and spend.",
     watchFor: "Expensive, slower, and less deterministic unless the agent is tightly constrained.",
+  },
+];
+
+const DOC_LINKS = [
+  {
+    id: "sales-letter",
+    title: "Sales letter: Why chunking breaks my RAG",
+    description: "Answers the core \"Why\" with the portfolio-ready narrative in README.md.",
+    badge: "Playbook",
+    href: salesLetterDoc,
+  },
+  {
+    id: "case-studies",
+    title: "Case studies: Context fragmentation in the wild",
+    description: "Quantifies script splits, orphaned lists, and semantic fixes via CASE_STUDIES.md.",
+    badge: "Data evidence",
+    href: caseStudiesDoc,
   },
 ];
 
@@ -1514,6 +1533,37 @@ function App() {
           </div>
         </div>
       </header>
+
+      <section className="docs-links">
+        <div className="card doc-card">
+          <div className="panel-head">
+            <div>
+              <p className="section-title">Docs & case studies</p>
+              <p className="muted">
+                Skim the sales letter for narrative framing or dive into the quantified failures before demoing the lab.
+              </p>
+            </div>
+            <div className="panel-head-actions">
+              <span className="chip subtle">Portfolio ready</span>
+            </div>
+          </div>
+          <div className="doc-link-grid">
+            {DOC_LINKS.map((doc) => (
+              <a
+                key={doc.id}
+                className="doc-link"
+                href={doc.href}
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                <span className="chip subtle">{doc.badge}</span>
+                <strong>{doc.title}</strong>
+                <p>{doc.description}</p>
+              </a>
+            ))}
+          </div>
+        </div>
+      </section>
 
       <section className="insights">
         <div className="card insights-card">
