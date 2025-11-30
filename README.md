@@ -46,13 +46,6 @@ npm run build   # type-check + production bundle (transformers chunk > 500 kB)
 npm run lint    # enforce React, Hooks, and TS rules
 ```
 
-## Talking Points For Your Portfolio
-
-- **Context fragmentation elevator pitch** - show the retrieval simulation where the Markdown splitter produces two hits for a single answer while recursive or semantic keeps the narrative intact.
-- **Data quality first** - walk through the raw HTML input, demonstrate how cleaning changes the broken-edge metric, and relate that to real ETL pipelines.
-- **Instrumentation mindset** - highlight the MiniLM preload/cache chip and metrics dashboard to prove you care about latency, observability, and scientific comparison.
-- **Iteration culture** - use the snapshot board to explain how RAG teams run experiments, capture baselines, and justify configuration changes with numbers.
-
 ## Roadmap Ideas
 
 - Add latency tracking per splitter or embedding path to tie UX perception to measurable performance.
@@ -61,4 +54,4 @@ npm run lint    # enforce React, Hooks, and TS rules
 
 ---
 
-Compare Chunker is more than a demo. It is a narrative device to prove you understand why chunking breaks RAG systems and how to diagnose, visualize, and remediate that risk like an AI Engineer.
+Compare Chunker is more than a demo. It is a narrative device to prove you understand why chunking breaks RAG systems and how to diagnose, visualize, and remediate that risk
