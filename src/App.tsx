@@ -1,11 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
-import type { ClipboardEvent, DragEvent } from "react";
+
 import {
   MarkdownTextSplitter,
   RecursiveCharacterTextSplitter,
 } from "@langchain/textsplitters";
+
 import salesLetterDoc from "../README.md?url";
 import caseStudiesDoc from "../CASE_STUDIES.md?url";
+import { generateQAPairs, validateApiKey } from "./goldStandardService";
+import { runBatchEvaluation, calculateMetrics, formatMetric, getBestStrategy } from "./evaluationEngine";
 import "./App.css";
 
 type ChunkCard = {
@@ -19,6 +22,7 @@ type ChunkCard = {
   splitter: "markdown" | "recursive" | "semantic";
 };
 
+
 type Insight = {
   id: string;
   title: string;
@@ -26,7 +30,6 @@ type Insight = {
   bestFor: string;
   watchFor: string;
 };
-
 type SectionKey = "insights" | "upload" | "markdown" | "recursive" | "semantic";
 
 type InputMode = "markdown" | "rawHtml";
@@ -36,7 +39,6 @@ type SemanticOptions = {
   chunkSize: number;
   similarity: number;
 };
-
 const ARTICLE_INSIGHTS: Insight[] = [
   {
     id: "01",
@@ -112,43 +114,6 @@ const DOC_LINKS = [
     href: caseStudiesDoc,
   },
 ];
-
-const SAMPLE_MD = `# Chunking Strategy: why cuts matter
-
-Modern retrieval pipelines live and die by context. When a chunk boundary slices through a sentence, we lose intent: prompts receive fragments instead of facts.
-
-## What an AI engineer cares about
-- predictable recall for long-form knowledge
-- enough overlap to reassemble meaning
-- respecting the document's own structure (headers, lists, code blocks)
-
-### Bad split example
-The spacecraft entered Mars orbit. The atmospheric model predicted a...
-<-- boundary here -->
-... 42% chance of dust storms. Mission control inferred the wrong risk.
-
-### Markdown-aware splitting
-Headers describe hierarchical meaning. Keeping them attached to their paragraphs makes embeddings richer and reranking easier.
-
-### Recursive character splitting
-Useful when content is noisy or unstructured, but it can still sever phrases if chunk sizes are too aggressive.
-
-## Takeaways
-- Tune chunk size and overlap to the retrieval budget.
-- Prefer structure-preserving splitters when the file already has signal.
-- Inspect the edges of chunks; that's where context usually leaks.`;
-
-const SAMPLE_RAW_HTML = `<div class="release-note">
-  <p><strong>🚧 Deployment log</strong></p>
-  <p>The crawler dumped raw <span style="color:#f66;">HTML</span> with inline scripts. Here's a slice:</p>
-  <ul>
-    <li><code>&lt;div class="summary"&gt;</code>Mission log shows <em>dust storms</em></li>
-    <li><code>&lt;span data-ts="03:42"&gt;</code>Engineers flagged boundary issues</li>
-  </ul>
-  <script type="text/javascript">console.log('noisy inline widget')</script>
-  <p>Without cleanup, Markdown splitters see tags instead of prose.</p>
-</div>`;
-
 const punctuationEnd = /[.!?…:;)]/;
 const strongStart = /^[A-Z0-9#>`*-]/;
 const DEFAULT_SEMANTIC_THRESHOLD = 0.82;
@@ -190,8 +155,8 @@ type EmbeddingResult =
   | Float32Array
   | number[]
   | {
-      data?: Float32Array | number[];
-    };
+    data?: Float32Array | number[];
+  };
 
 type LangChainDoc = {
   pageContent: string;
@@ -268,9 +233,50 @@ type Snapshot = {
   summary: {
     workingChars: number;
   };
+  goldStandard?: GoldStandardPair[];
+  evaluationMetrics?: StrategyEvaluationMetrics;
 };
 
+type GoldStandardPair = {
+  id: string;
+  question: string;
+  answerSnippet: string;
+  category?: string;
+  difficulty?: "easy" | "medium" | "hard";
+};
+
+type LLMProvider = "local" | "anthropic";
+
+type LLMConfig = {
+  provider: LLMProvider;
+  apiKey?: string;
+  temperature?: number;
+  pairCount?: number;
+};
+
+type QuestionEvaluationResult = {
+  questionId: string;
+  question: string;
+  answerSnippet: string;
+  results: Record<ChunkCard["splitter"], {
+    found: boolean;
+    rank: number | null; // Position where answer was found (1-indexed), null if not found
+    retrievedChunkIds: number[];
+    scores: number[];
+  }>;
+};
+
+type EvaluationMetrics = {
+  hitRate: number; // % of questions with answer in top-K
+  mrr: number; // Mean Reciprocal Rank
+  precision: number; // Relevant retrieved / Total retrieved
+  recall: number; // Relevant retrieved / Total relevant
+};
+
+type StrategyEvaluationMetrics = Record<ChunkCard["splitter"], EvaluationMetrics>;
+
 const SNAPSHOT_STORAGE_KEY = "compare-chunker-snapshots";
+const LLM_CONFIG_STORAGE_KEY = "compare-chunker-llm-config";
 
 type FeatureExtractionPipeline = (
   input: string | string[],
@@ -732,6 +738,42 @@ async function runSplit(
   };
 }
 
+const SAMPLE_MD = `# Chunking Strategy: why cuts matter
+
+Modern retrieval pipelines live and die by context. When a chunk boundary slices through a sentence, we lose intent: prompts receive fragments instead of facts.
+
+## What an AI engineer cares about
+- predictable recall for long-form knowledge
+- enough overlap to reassemble meaning
+- respecting the document's own structure (headers, lists, code blocks)
+
+### Bad split example
+The spacecraft entered Mars orbit. The atmospheric model predicted a...
+<-- boundary here -->
+... 42% chance of dust storms. Mission control inferred the wrong risk.
+
+### Markdown-aware splitting
+Headers describe hierarchical meaning. Keeping them attached to their paragraphs makes embeddings richer and reranking easier.
+
+### Recursive character splitting
+Useful when content is noisy or unstructured, but it can still sever phrases if chunk sizes are too aggressive.
+
+## Takeaways
+- Tune chunk size and overlap to the retrieval budget.
+- Prefer structure-preserving splitters when the file already has signal.
+- Inspect the edges of chunks; that's where context usually leaks.`;
+
+const SAMPLE_RAW_HTML = `<div class="release-note">
+  <p><strong>🚧 Deployment log</strong></p>
+  <p>The crawler dumped raw <span style="color:#f66;">HTML</span> with inline scripts. Here's a slice:</p>
+  <ul>
+    <li><code>&lt;div class="summary"&gt;</code>Mission log shows <em>dust storms</em></li>
+    <li><code>&lt;span data-ts="03:42"&gt;</code>Engineers flagged boundary issues</li>
+  </ul>
+  <script type="text/javascript">console.log('noisy inline widget')</script>
+  <p>Without cleanup, Markdown splitters see tags instead of prose.</p>
+</div>`;
+
 function App() {
   const [source, setSource] = useState<string>(SAMPLE_MD);
   const [fileName, setFileName] = useState<string>("sample-chunking.md");
@@ -742,6 +784,8 @@ function App() {
   const [chunkSize, setChunkSize] = useState<number>(900);
   const [overlap, setOverlap] = useState<number>(120);
   const [semanticThreshold, setSemanticThreshold] = useState<number>(DEFAULT_SEMANTIC_THRESHOLD);
+  const [showTools, setShowTools] = useState<boolean>(false);
+  const [showHelpModal, setShowHelpModal] = useState<boolean>(false);
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [results, setResults] = useState<{
     recursive: ChunkCard[];
@@ -753,12 +797,6 @@ function App() {
     recursive: [],
     semantic: [],
   });
-  const [focusRange, setFocusRange] = useState<{
-    start: number;
-    end: number;
-    splitter: "markdown" | "recursive" | "semantic";
-    label: string;
-  } | null>(null);
   const [semanticError, setSemanticError] = useState<string | null>(null);
   const [retrievalQuery, setRetrievalQuery] = useState<string>("");
   const [retrievalMatches, setRetrievalMatches] = useState<RetrievalMatches>({
@@ -785,6 +823,20 @@ function App() {
   const [variantAId, setVariantAId] = useState<string | null>(null);
   const [variantBId, setVariantBId] = useState<string | null>(null);
   const [snapshotsLoaded, setSnapshotsLoaded] = useState<boolean>(false);
+  const [goldStandardPairs, setGoldStandardPairs] = useState<GoldStandardPair[]>([]);
+  const [isGeneratingGold, setIsGeneratingGold] = useState<boolean>(false);
+  const [goldStandardError, setGoldStandardError] = useState<string | null>(null);
+  const [evaluationResults, setEvaluationResults] = useState<QuestionEvaluationResult[]>([]);
+  const [evaluationMetrics, setEvaluationMetrics] = useState<StrategyEvaluationMetrics | null>(null);
+  const [isEvaluating, setIsEvaluating] = useState<boolean>(false);
+  const [evaluationError, setEvaluationError] = useState<string | null>(null);
+  const [showEvalsModal, setShowEvalsModal] = useState<boolean>(false);
+  const [llmConfig, setLlmConfig] = useState<LLMConfig>({
+    provider: "anthropic",
+    temperature: 0.7,
+    pairCount: 10,
+  });
+  const [showSettings, setShowSettings] = useState<boolean>(false);
   const toggleSection = (section: SectionKey) => {
     setCollapsedSections((prev) => ({
       ...prev,
@@ -864,7 +916,7 @@ function App() {
   }, [workingText, chunkSize, overlap, semanticThreshold]);
 
   useEffect(() => {
-    if (typeof window === "undefined") return () => {};
+    if (typeof window === "undefined") return () => { };
     let cancelled = false;
     const cached = window.localStorage.getItem(MODEL_CACHE_KEY);
     const origin: ModelStatus["origin"] = cached ? "cache" : "network";
@@ -967,26 +1019,6 @@ function App() {
     }
   };
 
-  const handleDrop = async (e: DragEvent<HTMLLabelElement>) => {
-    e.preventDefault();
-    const file = e.dataTransfer?.files?.[0];
-    await handleFile(file, inputMode);
-  };
-
-  const handleMarkdownPaste = async (e: ClipboardEvent<HTMLTextAreaElement>) => {
-    if (e.clipboardData?.files?.length) {
-      e.preventDefault();
-      await handleFile(e.clipboardData.files[0], "markdown");
-    }
-  };
-
-  const handleRawPaste = async (e: ClipboardEvent<HTMLTextAreaElement>) => {
-    if (e.clipboardData?.files?.length) {
-      e.preventDefault();
-      await handleFile(e.clipboardData.files[0], "rawHtml");
-    }
-  };
-
   const ensureChunkVectors = async (
     splitter: ChunkCard["splitter"],
     chunks: ChunkCard[],
@@ -1077,6 +1109,128 @@ function App() {
     }
   };
 
+  // Load LLM config from localStorage on mount
+  useEffect(() => {
+    try {
+      const stored = localStorage.getItem(LLM_CONFIG_STORAGE_KEY);
+      if (stored) {
+        const config = JSON.parse(stored);
+        setLlmConfig((prev) => ({
+          ...prev,
+          ...config,
+          // Don't restore API key from localStorage for security
+          apiKey: prev.apiKey,
+        }));
+      }
+    } catch (error) {
+      console.error("Failed to load LLM config:", error);
+    }
+  }, []);
+
+  // Save LLM config to localStorage (except API key)
+  const saveLLMConfig = (config: LLMConfig) => {
+    try {
+      const toStore = {
+        provider: config.provider,
+        temperature: config.temperature,
+        pairCount: config.pairCount,
+        // Don't store API key in localStorage for security
+      };
+      localStorage.setItem(LLM_CONFIG_STORAGE_KEY, JSON.stringify(toStore));
+      setLlmConfig(config);
+    } catch (error) {
+      console.error("Failed to save LLM config:", error);
+    }
+  };
+
+  // Generate Gold Standard Q&A pairs
+  const handleGenerateGoldStandard = async () => {
+    if (!workingText || workingText.trim().length < 100) {
+      setGoldStandardError("Document is too short. Please provide at least 100 characters of text.");
+      return;
+    }
+
+    if (llmConfig.provider === "anthropic" && !validateApiKey(llmConfig.provider, llmConfig.apiKey || "")) {
+      setGoldStandardError("Invalid or missing Anthropic API key. Please configure it in settings.");
+      setShowSettings(true);
+      return;
+    }
+
+    setIsGeneratingGold(true);
+    setGoldStandardError(null);
+
+    try {
+      const pairs = await generateQAPairs(workingText, llmConfig);
+      setGoldStandardPairs(pairs);
+      setGoldStandardError(null);
+    } catch (error) {
+      console.error("Gold standard generation failed:", error);
+      setGoldStandardError(
+        error instanceof Error ? error.message : "Failed to generate gold standard pairs"
+      );
+    } finally {
+      setIsGeneratingGold(false);
+    }
+  };
+
+  // Run batch evaluation of gold standard pairs
+  const handleRunEvaluation = async () => {
+    if (goldStandardPairs.length === 0) {
+      setEvaluationError("No gold standard pairs available. Generate them first.");
+      return;
+    }
+
+    if (
+      !results.markdown.length &&
+      !results.recursive.length &&
+      !results.semantic.length
+    ) {
+      setEvaluationError("Chunks are still loading. Try again in a moment.");
+      return;
+    }
+
+    setIsEvaluating(true);
+    setEvaluationError(null);
+
+    try {
+      // Ensure all chunk vectors are ready
+      const markdownVecs = await ensureChunkVectors("markdown", results.markdown);
+      const recursiveVecs = await ensureChunkVectors("recursive", results.recursive);
+      const semanticVecs = await ensureChunkVectors("semantic", results.semantic);
+
+      const vectors = {
+        markdown: markdownVecs,
+        recursive: recursiveVecs,
+        semantic: semanticVecs,
+      };
+
+      // Run batch evaluation
+      const evalResults = await runBatchEvaluation(
+        goldStandardPairs,
+        results,
+        vectors,
+        embedTexts,
+        RETRIEVAL_TOP_K,
+        RETRIEVAL_SCORE_FLOOR
+      );
+
+      // Calculate metrics
+      const metrics = calculateMetrics(evalResults);
+
+      setEvaluationResults(evalResults);
+      setEvaluationMetrics(metrics);
+      setShowEvalsModal(true);
+      setEvaluationError(null);
+    } catch (error) {
+      console.error("Evaluation failed:", error);
+      setEvaluationError(
+        error instanceof Error ? error.message : "Failed to run evaluation"
+      );
+    } finally {
+      setIsEvaluating(false);
+    }
+  };
+
   const formatScore = (value: number | null | undefined) => {
     if (value === undefined || value === null || Number.isNaN(value)) return "--";
     return `${Math.round(value * 100)}%`;
@@ -1135,6 +1289,12 @@ function App() {
 
   const getBestScore = (snapshot: Snapshot | null, splitter: ChunkCard["splitter"]) =>
     snapshot?.retrievalMatches[splitter]?.bestScore ?? null;
+
+  const getEvalMetric = (
+    snapshot: Snapshot | null,
+    splitter: ChunkCard["splitter"],
+    metric: "hitRate" | "mrr" | "precision" | "recall"
+  ) => snapshot?.evaluationMetrics?.[splitter]?.[metric] ?? null;
 
   const formatCount = (value: number | null) =>
     value === null ? "--" : value.toLocaleString();
@@ -1241,27 +1401,9 @@ function App() {
   const modelStatusDetail =
     modelStatus.state === "error" ? modelStatus.message ?? null : null;
 
-  const highlightColor = focusRange
-    ? focusRange.splitter === "markdown"
-      ? "var(--accent)"
-      : focusRange.splitter === "semantic"
-        ? "var(--iris)"
-        : "var(--amber)"
-    : "var(--accent)";
 
-  const renderWorkingSource = (text: string) => {
-    if (!focusRange || focusRange.start < 0 || focusRange.end < 0)
-      return <pre className="source-view">{text}</pre>;
-    return (
-      <pre className="source-view">
-        <span>{text.slice(0, focusRange.start)}</span>
-        <span className="highlight" style={{ backgroundColor: highlightColor }}>
-          {text.slice(focusRange.start, focusRange.end)}
-        </span>
-        <span>{text.slice(focusRange.end)}</span>
-      </pre>
-    );
-  };
+
+
 
   const canSaveSnapshot = snapshotsLoaded && !isLoading && Boolean(workingText.trim());
 
@@ -1314,6 +1456,8 @@ function App() {
       summary: {
         workingChars: workingText.length,
       },
+      goldStandard: goldStandardPairs.length > 0 ? [...goldStandardPairs] : undefined,
+      evaluationMetrics: evaluationMetrics ? JSON.parse(JSON.stringify(evaluationMetrics)) : undefined,
     };
     setSnapshots((prev) => [snapshotRecord, ...prev]);
     if (!variantAId) {
@@ -1327,7 +1471,7 @@ function App() {
   const loadSnapshotById = (id: string) => {
     const snapshot = snapshots.find((entry) => entry.id === id);
     if (!snapshot) return;
-    const { config, files } = snapshot;
+    const { config, files, goldStandard, evaluationMetrics: evalMetrics } = snapshot;
     setSource(files.source);
     setRawSource(files.rawSource);
     setFileName(files.fileName);
@@ -1338,7 +1482,20 @@ function App() {
     setOverlap(config.overlap);
     setSemanticThreshold(config.semanticThreshold);
     setRetrievalQuery(config.retrievalQuery);
-    setFocusRange(null);
+
+
+    // Restore gold standard and evaluation metrics if available
+    if (goldStandard && goldStandard.length > 0) {
+      setGoldStandardPairs([...goldStandard]);
+    } else {
+      setGoldStandardPairs([]);
+    }
+
+    if (evalMetrics) {
+      setEvaluationMetrics(JSON.parse(JSON.stringify(evalMetrics)));
+    } else {
+      setEvaluationMetrics(null);
+    }
   };
 
   const deleteSnapshot = (id: string) => {
@@ -1500,312 +1657,220 @@ function App() {
         suffix: "%",
       }),
     },
+    // Evaluation Metrics (if available)
+    ...(variantA?.evaluationMetrics || variantB?.evaluationMetrics
+      ? [
+        {
+          label: "Hit Rate • Markdown",
+          valueA: formatPercentMetric(toPercent(getEvalMetric(variantA, "markdown", "hitRate"))),
+          valueB: formatPercentMetric(toPercent(getEvalMetric(variantB, "markdown", "hitRate"))),
+          delta: formatDeltaValue(
+            toPercent(getEvalMetric(variantA, "markdown", "hitRate")),
+            toPercent(getEvalMetric(variantB, "markdown", "hitRate")),
+            { suffix: "%", decimals: 1 }
+          ),
+        },
+        {
+          label: "Hit Rate • Recursive",
+          valueA: formatPercentMetric(toPercent(getEvalMetric(variantA, "recursive", "hitRate"))),
+          valueB: formatPercentMetric(toPercent(getEvalMetric(variantB, "recursive", "hitRate"))),
+          delta: formatDeltaValue(
+            toPercent(getEvalMetric(variantA, "recursive", "hitRate")),
+            toPercent(getEvalMetric(variantB, "recursive", "hitRate")),
+            { suffix: "%", decimals: 1 }
+          ),
+        },
+        {
+          label: "Hit Rate • Semantic",
+          valueA: formatPercentMetric(toPercent(getEvalMetric(variantA, "semantic", "hitRate"))),
+          valueB: formatPercentMetric(toPercent(getEvalMetric(variantB, "semantic", "hitRate"))),
+          delta: formatDeltaValue(
+            toPercent(getEvalMetric(variantA, "semantic", "hitRate")),
+            toPercent(getEvalMetric(variantB, "semantic", "hitRate")),
+            { suffix: "%", decimals: 1 }
+          ),
+        },
+        {
+          label: "MRR • Markdown",
+          valueA: getEvalMetric(variantA, "markdown", "mrr")?.toFixed(3) ?? "--",
+          valueB: getEvalMetric(variantB, "markdown", "mrr")?.toFixed(3) ?? "--",
+          delta: formatDeltaValue(
+            getEvalMetric(variantA, "markdown", "mrr"),
+            getEvalMetric(variantB, "markdown", "mrr"),
+            { decimals: 3 }
+          ),
+        },
+        {
+          label: "MRR • Recursive",
+          valueA: getEvalMetric(variantA, "recursive", "mrr")?.toFixed(3) ?? "--",
+          valueB: getEvalMetric(variantB, "recursive", "mrr")?.toFixed(3) ?? "--",
+          delta: formatDeltaValue(
+            getEvalMetric(variantA, "recursive", "mrr"),
+            getEvalMetric(variantB, "recursive", "mrr"),
+            { decimals: 3 }
+          ),
+        },
+        {
+          label: "MRR • Semantic",
+          valueA: getEvalMetric(variantA, "semantic", "mrr")?.toFixed(3) ?? "--",
+          valueB: getEvalMetric(variantB, "semantic", "mrr")?.toFixed(3) ?? "--",
+          delta: formatDeltaValue(
+            getEvalMetric(variantA, "semantic", "mrr"),
+            getEvalMetric(variantB, "semantic", "mrr"),
+            { decimals: 3 }
+          ),
+        },
+        {
+          label: "Precision • Markdown",
+          valueA: formatPercentMetric(toPercent(getEvalMetric(variantA, "markdown", "precision"))),
+          valueB: formatPercentMetric(toPercent(getEvalMetric(variantB, "markdown", "precision"))),
+          delta: formatDeltaValue(
+            toPercent(getEvalMetric(variantA, "markdown", "precision")),
+            toPercent(getEvalMetric(variantB, "markdown", "precision")),
+            { suffix: "%", decimals: 1 }
+          ),
+        },
+        {
+          label: "Precision • Recursive",
+          valueA: formatPercentMetric(toPercent(getEvalMetric(variantA, "recursive", "precision"))),
+          valueB: formatPercentMetric(toPercent(getEvalMetric(variantB, "recursive", "precision"))),
+          delta: formatDeltaValue(
+            toPercent(getEvalMetric(variantA, "recursive", "precision")),
+            toPercent(getEvalMetric(variantB, "recursive", "precision")),
+            { suffix: "%", decimals: 1 }
+          ),
+        },
+        {
+          label: "Precision • Semantic",
+          valueA: formatPercentMetric(toPercent(getEvalMetric(variantA, "semantic", "precision"))),
+          valueB: formatPercentMetric(toPercent(getEvalMetric(variantB, "semantic", "precision"))),
+          delta: formatDeltaValue(
+            toPercent(getEvalMetric(variantA, "semantic", "precision")),
+            toPercent(getEvalMetric(variantB, "semantic", "precision")),
+            { suffix: "%", decimals: 1 }
+          ),
+        },
+        {
+          label: "Recall • Markdown",
+          valueA: formatPercentMetric(toPercent(getEvalMetric(variantA, "markdown", "recall"))),
+          valueB: formatPercentMetric(toPercent(getEvalMetric(variantB, "markdown", "recall"))),
+          delta: formatDeltaValue(
+            toPercent(getEvalMetric(variantA, "markdown", "recall")),
+            toPercent(getEvalMetric(variantB, "markdown", "recall")),
+            { suffix: "%", decimals: 1 }
+          ),
+        },
+        {
+          label: "Recall • Recursive",
+          valueA: formatPercentMetric(toPercent(getEvalMetric(variantA, "recursive", "recall"))),
+          valueB: formatPercentMetric(toPercent(getEvalMetric(variantB, "recursive", "recall"))),
+          delta: formatDeltaValue(
+            toPercent(getEvalMetric(variantA, "recursive", "recall")),
+            toPercent(getEvalMetric(variantB, "recursive", "recall")),
+            { suffix: "%", decimals: 1 }
+          ),
+        },
+        {
+          label: "Recall • Semantic",
+          valueA: formatPercentMetric(toPercent(getEvalMetric(variantA, "semantic", "recall"))),
+          valueB: formatPercentMetric(toPercent(getEvalMetric(variantB, "semantic", "recall"))),
+          delta: formatDeltaValue(
+            toPercent(getEvalMetric(variantA, "semantic", "recall")),
+            toPercent(getEvalMetric(variantB, "semantic", "recall")),
+            { suffix: "%", decimals: 1 }
+          ),
+        },
+      ]
+      : []),
   ];
 
   return (
     <div className="page">
-      <header className="hero">
-        <div>
-          <p className="eyebrow">Chunking Strategy • AI Engineer playbook</p>
-          <h1>Context survives—or snaps—when you slice Markdown.</h1>
-          <p className="lede">
-            Compare <strong>RecursiveCharacterTextSplitter</strong>,{" "}
-            <strong>MarkdownTextSplitter</strong>, and a new{" "}
-            <strong>semantic embedder</strong> (MiniLM via Transformers.js).
-            Upload a large .md, tweak chunk size/overlap, and inspect where
-            edges cut sentences—or let embeddings decide when topics shift.
-          </p>
-          <div className="metrics">
-            <div>
-              <span className="label">Active file</span>
-              <p className="value">{activeFileName}</p>
-            </div>
-            <div>
-              <span className="label">Characters</span>
-              <p className="value">{totalChars.toLocaleString()}</p>
-            </div>
-            <div>
-              <span className="label">Chunks</span>
-              <p className="value">
-                MD {results.markdown.length} • RC {results.recursive.length} • SEM {results.semantic.length}
-              </p>
-            </div>
-          </div>
-        </div>
-      </header>
-
-      <section className="docs-links">
-        <div className="card doc-card">
-          <div className="panel-head">
-            <div>
-              <p className="section-title">Docs & case studies</p>
-              <p className="muted">
-                Skim the sales letter for narrative framing or dive into the quantified failures before demoing the lab.
-              </p>
-            </div>
-            <div className="panel-head-actions">
-              <span className="chip subtle">Portfolio ready</span>
-            </div>
-          </div>
-          <div className="doc-link-grid">
-            {DOC_LINKS.map((doc) => (
-              <a
-                key={doc.id}
-                className="doc-link"
-                href={doc.href}
-                target="_blank"
-                rel="noopener noreferrer"
-              >
-                <span className="chip subtle">{doc.badge}</span>
-                <strong>{doc.title}</strong>
-                <p>{doc.description}</p>
-              </a>
-            ))}
-          </div>
-        </div>
-      </section>
-
-      <section className="insights">
-        <div className="card insights-card">
-          <div className="panel-head">
-            <div>
-              <p className="section-title">Field guide: 7 chunking plays</p>
-            </div>
-            <div className="panel-head-actions">
-              <span className="chip subtle">Educational insights</span>
-              <button
-                type="button"
-                className="collapse-toggle"
-                onClick={() => toggleSection("insights")}
-                aria-expanded={!collapsedSections.insights}
-                aria-controls="insights-panel"
-              >
-                {collapsedSections.insights ? "Expand" : "Collapse"}
-              </button>
-            </div>
-          </div>
-          <div
-            id="insights-panel"
-            className="insight-grid collapsible-content"
-            hidden={collapsedSections.insights}
-            aria-hidden={collapsedSections.insights}
-          >
-            {ARTICLE_INSIGHTS.map((insight) => (
-              <article key={insight.id} className="insight">
-                <div className="insight-head">
-                  <span className="chip subtle">{insight.id}</span>
-                  <h3>{insight.title}</h3>
-                </div>
-                <p className="insight-summary">{insight.summary}</p>
-                <div className="insight-meta">
-                  <p>
-                    <span className="meta-label">Best for</span>
-                    {insight.bestFor}
-                  </p>
-                  <p>
-                    <span className="meta-label">Watch for</span>
-                    {insight.watchFor}
-                  </p>
-                </div>
-              </article>
-            ))}
-          </div>
-        </div>
-      </section>
-
-      <section className="panel-grid compact">
-        <div className="card upload">
-          <div className="panel-head">
-            <div>
-              <p className="section-title">Load text & clean it</p>
-              <p className="muted">
-                Drop Markdown or raw HTML. Flip into dirty mode to feel how cleaning protects chunk quality.
-              </p>
-            </div>
-            <div className="panel-head-actions">
-              <button
-                type="button"
-                className="collapse-toggle"
-                onClick={() => toggleSection("upload")}
-                aria-expanded={!collapsedSections.upload}
-                aria-controls="upload-panel"
-              >
-                {collapsedSections.upload ? "Expand" : "Collapse"}
-              </button>
-            </div>
-          </div>
-          <div
-            id="upload-panel"
-            className="collapsible-stack collapsible-content"
-            hidden={collapsedSections.upload}
-            aria-hidden={collapsedSections.upload}
-          >
-            <div className="upload-row">
-              <label
-                className="dropzone"
-                onDrop={handleDrop}
-                onDragOver={(e) => e.preventDefault()}
-              >
+      <header className="sticky-header">
+        <div className="header-content">
+          <div className="header-left">
+            <h1>Compare Chunker</h1>
+            <div className="header-controls">
+              <label className="btn-upload">
+                Upload
                 <input
                   type="file"
                   accept=".md,.markdown,.txt,.html,text/markdown,text/plain,text/html"
                   onChange={(e) => handleFile(e.target.files?.[0], inputMode)}
+                  hidden
                 />
-                <div>
-                  <p className="big">Drop Markdown / HTML</p>
-                  <p className="muted">routes to the active tab</p>
-                </div>
               </label>
-              <div className="controls mini">
-                <div className="control tight">
-                  <label htmlFor="chunkSize">Chunk size</label>
-                  <div className="slider-row">
-                    <input
-                      id="chunkSize"
-                      type="range"
-                      min={300}
-                      max={1800}
-                      step={50}
-                      value={chunkSize}
-                      onChange={(e) => setChunkSize(Number(e.target.value))}
-                    />
-                    <span className="chip">{chunkSize}</span>
-                  </div>
-                </div>
-                <div className="control tight">
-                  <label htmlFor="overlap">Overlap</label>
-                  <div className="slider-row">
-                    <input
-                      id="overlap"
-                      type="range"
-                      min={0}
-                      max={Math.max(0, chunkSize - 20)}
-                      step={10}
-                      value={overlap}
-                      onChange={(e) => setOverlap(Number(e.target.value))}
-                    />
-                    <span className="chip">{overlap}</span>
-                  </div>
-                </div>
-                <div className="control tight">
-                  <label htmlFor="semanticThreshold">
-                    Semantic cohesion
-                    <span className="muted inline-hint">Higher = stricter merges</span>
-                  </label>
-                  <div className="slider-row">
-                    <input
-                      id="semanticThreshold"
-                      type="range"
-                      min={MIN_SEMANTIC_THRESHOLD}
-                      max={MAX_SEMANTIC_THRESHOLD}
-                      step={0.01}
-                      value={semanticThreshold}
-                      onChange={(e) =>
-                        setSemanticThreshold(Number(e.target.value))
-                      }
-                    />
-                    <span className="chip">{semanticThreshold.toFixed(2)}</span>
-                  </div>
-                </div>
+
+              <div className="control-group">
+                <label htmlFor="chunkSize">Size: {chunkSize}</label>
+                <input
+                  id="chunkSize"
+                  type="range"
+                  min={300}
+                  max={1800}
+                  step={50}
+                  value={chunkSize}
+                  onChange={(e) => setChunkSize(Number(e.target.value))}
+                />
               </div>
-            </div>
-            <div className="source-pane">
-              <div className="source-meta">
-                <span className="chip subtle">{activeFileName}</span>
-                <span className="chip subtle">
-                  {inputMode === "markdown"
-                    ? "Markdown assumed clean"
-                    : shouldCleanRawHtml
-                      ? "Raw HTML → cleaned"
-                      : "Raw HTML (dirty)"}
-                </span>
-                {focusRange && (
-                  <span className="chip" style={{ background: highlightColor }}>
-                    Highlight: {focusRange.label}
-                  </span>
-                )}
+
+              <div className="control-group">
+                <label htmlFor="overlap">Overlap: {overlap}</label>
+                <input
+                  id="overlap"
+                  type="range"
+                  min={0}
+                  max={600}
+                  step={10}
+                  value={overlap}
+                  onChange={(e) => setOverlap(Number(e.target.value))}
+                />
               </div>
-              <div
-                className="input-mode-toggle"
-                role="tablist"
-                aria-label="Input mode"
+
+              <select
+                value={inputMode}
+                onChange={(e) => setInputMode(e.target.value as InputMode)}
+                className="mode-select"
               >
-                <button
-                  type="button"
-                  className={`mode-pill${inputMode === "markdown" ? " active" : ""}`}
-                  onClick={() => setInputMode("markdown")}
-                  aria-pressed={inputMode === "markdown"}
-                >
-                  Markdown
-                </button>
-                <button
-                  type="button"
-                  className={`mode-pill${inputMode === "rawHtml" ? " active" : ""}`}
-                  onClick={() => setInputMode("rawHtml")}
-                  aria-pressed={inputMode === "rawHtml"}
-                >
-                  Raw HTML / dirty text
-                </button>
-              </div>
-              {inputMode === "markdown" ? (
-                <>
-                  <textarea
-                    className="editor mini"
-                    value={source}
-                    onChange={(e) => setSource(e.target.value)}
-                    onPaste={handleMarkdownPaste}
-                    spellCheck={false}
-                    aria-label="Markdown editor"
-                  />
-                  {renderWorkingSource(workingText)}
-                </>
-              ) : (
-                <div className="dirty-lab">
-                  <div className="dirty-column">
-                    <label htmlFor="rawInput">Raw HTML or dirty text</label>
-                    <textarea
-                      id="rawInput"
-                      className="editor mini"
-                      value={rawSource}
-                      onChange={(e) => setRawSource(e.target.value)}
-                      onPaste={handleRawPaste}
-                      spellCheck={false}
-                      aria-label="Raw HTML editor"
-                    />
-                    <label className="clean-toggle">
-                      <input
-                        type="checkbox"
-                        checked={shouldCleanRawHtml}
-                        onChange={(e) => setShouldCleanRawHtml(e.target.checked)}
-                      />
-                      Clean before chunking (strip tags, flatten lists)
-                    </label>
-                    <p className="muted">
-                      Disable cleaning to watch MarkdownTextSplitter trip over literal tags, then re-enable to showcase your ETL fix.
-                    </p>
-                  </div>
-                  <div className="dirty-column preview-column">
-                    <div className="dirty-preview-head">
-                      <span className="chip subtle">Working text</span>
-                      <span className={`chip ${shouldCleanRawHtml ? "ok" : "warn"}`}>
-                        {shouldCleanRawHtml ? "Cleaned for chunking" : "As-is (noisy)"}
-                      </span>
-                      <span className="chip subtle">
-                        {workingText.length.toLocaleString()} chars
-                      </span>
-                    </div>
-                    {renderWorkingSource(workingText)}
-                    {!shouldCleanRawHtml && (
-                      <div className="note warn mini">
-                        MarkdownTextSplitter sees raw tags; compare quality metrics before toggling cleaning back on.
-                      </div>
-                    )}
-                  </div>
-                </div>
-              )}
+                <option value="markdown">Markdown</option>
+                <option value="rawHtml">Raw HTML</option>
+              </select>
+
+              <button
+                type="button"
+                className={`toggle-btn ${shouldCleanRawHtml ? "active" : ""}`}
+                onClick={() => setShouldCleanRawHtml(!shouldCleanRawHtml)}
+                title="Clean HTML/Markdown"
+              >
+                {shouldCleanRawHtml ? "Clean: ON" : "Clean: OFF"}
+              </button>
+
+              <button
+                type="button"
+                className={`toggle-btn ${showTools ? "active" : ""}`}
+                onClick={() => setShowTools(!showTools)}
+              >
+                Tools
+              </button>
             </div>
           </div>
+
+          <div className="header-right">
+            <div className="metrics-summary">
+              <span>{activeFileName}</span>
+              <span className="separator">•</span>
+              <span>{totalChars.toLocaleString()} chars</span>
+            </div>
+            <button
+              className="secondary-btn small"
+              onClick={() => setShowHelpModal(true)}
+            >
+              Help / Docs
+            </button>
+          </div>
         </div>
+      </header>
+      {showTools && (<div className="tools-container">
 
         <div className="card retrieval-card">
           <div className="panel-head">
@@ -1869,21 +1934,20 @@ function App() {
                             : "No hits"}
                         </span>
                         <span
-                          className={`chip ${
-                            chunkList.length === 0
-                              ? "subtle"
-                              : summary.fragmented
-                                ? "warn"
-                                : "ok"
-                          }`}
+                          className={`chip ${chunkList.length === 0
+                            ? "subtle"
+                            : summary.fragmented
+                              ? "warn"
+                              : "ok"
+                            }`}
                         >
                           {statusLabel}
                         </span>
                         <p className="summary-copy">
                           {chunkList.length
                             ? `Chunks ${chunkList
-                                .map((idx) => `#${idx + 1}`)
-                                .join(", ")}`
+                              .map((idx) => `#${idx + 1}`)
+                              .join(", ")}`
                             : "Below score floor"}
                         </p>
                       </div>
@@ -1899,213 +1963,348 @@ function App() {
           </div>
         </div>
 
-        <div className="card quality-card">
+        <div className="card gold-standard-card">
           <div className="panel-head">
             <div>
-              <p className="section-title">Quality metrics</p>
+              <p className="section-title">Gold Standard Generator</p>
               <p className="muted">
-                Quantify sentence breaks and chunk-size variance so you can cite data, not vibes.
+                Generate Q&A pairs from your document to objectively evaluate chunking strategies.
               </p>
             </div>
-          </div>
-          <div className="quality-grid">
-            {RETRIEVAL_SPLITTERS.map((splitter) => {
-              const stats = qualityStats[splitter];
-              const chunkLabel = stats.sampleSize
-                ? `${stats.sampleSize} chunk${stats.sampleSize === 1 ? "" : "s"}`
-                : "Awaiting chunks";
-              return (
-                <article key={`quality-${splitter}`} className="quality-tile">
-                  <div className="tile-head">
-                    <span className="chip subtle">{SPLITTER_LABELS[splitter]}</span>
-                    <span className="chip subtle">{chunkLabel}</span>
-                  </div>
-                  <div className="metric-pair">
-                    <div>
-                      <p className="metric-label">Broken edges</p>
-                      <p className="metric-value">
-                        {formatPercentMetric(stats.brokenPercent)}
-                      </p>
-                    </div>
-                    <div>
-                      <p className="metric-label">Chunk size σ</p>
-                      <p className="metric-value">
-                        {formatCharsMetric(stats.stdDeviation)}
-                      </p>
-                    </div>
-                  </div>
-                  <p className="metric-footnote">
-                    {stats.meanSize !== null
-                      ? `Avg ${formatCharsMetric(stats.meanSize)}`
-                      : "Waiting for chunking"}
-                  </p>
-                </article>
-              );
-            })}
-          </div>
-        </div>
-      </section>
-
-      <section className="ab-section">
-        <div className="card snapshot-card">
-          <div className="panel-head">
-            <div>
-              <p className="section-title">Snapshots & persistence</p>
-              <p className="muted">
-                Capture the current text, chunk settings, quality metrics, and retrieval summary so you can reload or compare after a refresh.
-              </p>
-            </div>
-          </div>
-          <div className="snapshot-form">
-            <input
-              type="text"
-              placeholder={`e.g. ${activeFileName} baseline`}
-              value={snapshotName}
-              onChange={(e) => {
-                setSnapshotName(e.target.value);
-                if (snapshotError) setSnapshotError(null);
-              }}
-            />
             <button
               type="button"
-              className="primary-btn"
-              onClick={handleSnapshotSave}
-              disabled={!canSaveSnapshot}
+              className="icon-btn"
+              onClick={() => setShowSettings(!showSettings)}
+              title={showSettings ? "Hide settings" : "Show settings"}
             >
-              Save snapshot
+              {showSettings ? "▼" : "▶"} Settings
             </button>
           </div>
-          <div className="snapshot-hint">
-            <span className="chip subtle">
-              {snapshots.length ? `${snapshots.length} saved` : "No snapshots yet"}
-            </span>
-            <span className="muted">Stored locally in this browser.</span>
-          </div>
-          {snapshotError && <div className="note warn mini">{snapshotError}</div>}
-          {snapshots.length ? (
-            <div className="snapshot-list">
-              {snapshots.map((snapshot) => {
-                const variantBadge =
-                  snapshot.id === variantAId
-                    ? "Variant A"
-                    : snapshot.id === variantBId
-                      ? "Variant B"
-                      : null;
-                const inputLabel = getSnapshotInputLabel(snapshot);
-                const queryPreview = snapshot.config.retrievalQuery.trim()
-                  ? truncateText(snapshot.config.retrievalQuery.trim(), 80)
-                  : null;
-                return (
-                  <article key={snapshot.id} className="snapshot-item">
-                    <div className="snapshot-item-head">
-                      <div>
-                        <p className="snapshot-name">{snapshot.name}</p>
-                        <p className="muted snapshot-date">
-                          {formatSnapshotTimestamp(snapshot.createdAt)}
-                        </p>
-                      </div>
-                      <div className="snapshot-tag-group">
-                        {variantBadge && <span className="chip match">{variantBadge}</span>}
-                        <span className="chip subtle">{inputLabel}</span>
-                        <span className="chip subtle">Size {snapshot.config.chunkSize}</span>
-                        <span className="chip subtle">Overlap {snapshot.config.overlap}</span>
-                        <span className="chip subtle">
-                          Sem {snapshot.config.semanticThreshold.toFixed(2)}
-                        </span>
-                      </div>
-                    </div>
-                    <div className="snapshot-meta">
-                      <p>
-                        <span className="meta-label">Chars</span>
-                        {snapshot.summary.workingChars.toLocaleString()}
-                      </p>
-                      <p>
-                        <span className="meta-label">Chunks</span>
-                        MD {snapshot.results.markdown.length} • RC {snapshot.results.recursive.length} • SEM {snapshot.results.semantic.length}
-                      </p>
-                    </div>
-                    <p className={`snapshot-query ${queryPreview ? "" : "muted"}`}>
-                      <span className="meta-label">Query</span>
-                      {queryPreview ? ` “${queryPreview}”` : " None saved"}
-                    </p>
-                    <div className="snapshot-actions">
-                      <button type="button" className="ghost-btn" onClick={() => loadSnapshotById(snapshot.id)}>
-                        Load & activate
-                      </button>
-                      <button
-                        type="button"
-                        className={`pill-btn${variantAId === snapshot.id ? " active" : ""}`}
-                        onClick={() => assignVariant("A", snapshot.id)}
-                      >
-                        {variantAId === snapshot.id ? "Pinned A" : "Set A"}
-                      </button>
-                      <button
-                        type="button"
-                        className={`pill-btn${variantBId === snapshot.id ? " active" : ""}`}
-                        onClick={() => assignVariant("B", snapshot.id)}
-                      >
-                        {variantBId === snapshot.id ? "Pinned B" : "Set B"}
-                      </button>
-                      <button
-                        type="button"
-                        className="text-btn danger"
-                        onClick={() => deleteSnapshot(snapshot.id)}
-                      >
-                        Delete
-                      </button>
-                    </div>
-                  </article>
-                );
-              })}
+
+          {showSettings && (
+            <div className="settings-panel">
+              <div className="control tight">
+                <label htmlFor="llmProvider">LLM Provider</label>
+                <select
+                  id="llmProvider"
+                  value={llmConfig.provider}
+                  onChange={(e) => saveLLMConfig({
+                    ...llmConfig,
+                    provider: e.target.value as LLMProvider,
+                  })}
+                >
+                  <option value="anthropic">Anthropic Claude (API)</option>
+                  <option value="local">Local LLM (Browser)</option>
+                </select>
+                <p className="muted">
+                  {llmConfig.provider === "anthropic"
+                    ? "High-quality Q&A generation using Claude API (requires API key)"
+                    : "Privacy-first browser-based generation using Flan-T5 (slower, lower quality)"}
+                </p>
+              </div>
+
+              {llmConfig.provider === "anthropic" && (
+                <div className="control tight">
+                  <label htmlFor="apiKey">Anthropic API Key</label>
+                  <input
+                    id="apiKey"
+                    type="password"
+                    placeholder="sk-ant-..."
+                    value={llmConfig.apiKey || ""}
+                    onChange={(e) => setLlmConfig({
+                      ...llmConfig,
+                      apiKey: e.target.value,
+                    })}
+                  />
+                  <p className="muted">
+                    Get your API key from{" "}
+                    <a href="https://console.anthropic.com" target="_blank" rel="noopener noreferrer">
+                      console.anthropic.com
+                    </a>
+                    . Not stored in snapshots for security.
+                  </p>
+                </div>
+              )}
+
+              <div className="control tight">
+                <label htmlFor="pairCount">Number of Q&A Pairs</label>
+                <input
+                  id="pairCount"
+                  type="number"
+                  min="5"
+                  max="20"
+                  value={llmConfig.pairCount || 10}
+                  onChange={(e) => saveLLMConfig({
+                    ...llmConfig,
+                    pairCount: parseInt(e.target.value) || 10,
+                  })}
+                />
+              </div>
+
+              <div className="control tight">
+                <label htmlFor="temperature">Temperature ({llmConfig.temperature?.toFixed(1)})</label>
+                <input
+                  id="temperature"
+                  type="range"
+                  min="0"
+                  max="1"
+                  step="0.1"
+                  value={llmConfig.temperature || 0.7}
+                  onChange={(e) => saveLLMConfig({
+                    ...llmConfig,
+                    temperature: parseFloat(e.target.value),
+                  })}
+                />
+                <p className="muted">
+                  Lower = more focused, Higher = more creative
+                </p>
+              </div>
             </div>
-          ) : (
-            <p className="muted empty-copy">
-              Save a snapshot after chunking finishes to persist this configuration and unlock the A/B dashboard.
-            </p>
           )}
+
+          <div className="collapsible-stack">
+            <div className="gold-standard-controls">
+              <button
+                type="button"
+                className="primary-btn"
+                onClick={handleGenerateGoldStandard}
+                disabled={isGeneratingGold || !workingText.trim()}
+              >
+                {isGeneratingGold ? "Generating..." : "Generate Gold Standard"}
+              </button>
+
+              {goldStandardPairs.length > 0 && (
+                <>
+                  <span className="chip ok">
+                    {goldStandardPairs.length} Q&A pairs ready
+                  </span>
+                  <button
+                    type="button"
+                    className="primary-btn"
+                    onClick={handleRunEvaluation}
+                    disabled={isEvaluating}
+                  >
+                    {isEvaluating ? "Evaluating..." : "Run Evaluation"}
+                  </button>
+                  {evaluationMetrics && (
+                    <button
+                      type="button"
+                      className="secondary-btn"
+                      onClick={() => setShowEvalsModal(true)}
+                    >
+                      View Results
+                    </button>
+                  )}
+                </>
+              )}
+            </div>
+
+            {goldStandardError && (
+              <div className="note warn mini">{goldStandardError}</div>
+            )}
+
+            {evaluationError && (
+              <div className="note warn mini">{evaluationError}</div>
+            )}
+
+            {goldStandardPairs.length > 0 && (
+              <div className="gold-standard-preview">
+                <p className="muted">Sample questions:</p>
+                <ul className="question-list">
+                  {goldStandardPairs.slice(0, 3).map((pair) => (
+                    <li key={pair.id}>
+                      <strong>Q:</strong> {pair.question}
+                      <br />
+                      <span className="muted">
+                        <strong>A:</strong> {pair.answerSnippet.slice(0, 100)}
+                        {pair.answerSnippet.length > 100 ? "..." : ""}
+                      </span>
+                    </li>
+                  ))}
+                  {goldStandardPairs.length > 3 && (
+                    <li className="muted">
+                      + {goldStandardPairs.length - 3} more questions
+                    </li>
+                  )}
+                </ul>
+              </div>
+            )}
+          </div>
         </div>
 
-        <div className="card ab-card">
-          <div className="panel-head">
-            <div>
-              <p className="section-title">A/B testing board</p>
-              <p className="muted">
-                Pin two snapshots to compare chunk math, edge cleanliness, and retrieval scores side-by-side.
-              </p>
-            </div>
-          </div>
-          <div className="ab-columns">
-            {renderVariantColumn("A", variantA)}
-            {renderVariantColumn("B", variantB)}
-          </div>
-          <div className="delta-table">
-            <div className="comparison-row heading">
-              <span>Metric</span>
-              <span>Variant A</span>
-              <span>Variant B</span>
-              <span>Δ (A − B)</span>
-            </div>
-            {comparisonRows.map((row) => (
-              <div key={row.label} className="comparison-row">
-                <span>{row.label}</span>
-                <span>{row.valueA}</span>
-                <span>{row.valueB}</span>
-                <span>{row.delta}</span>
+
+
+        <section className="ab-section">
+          <div className="card snapshot-card">
+            <div className="panel-head">
+              <div>
+                <p className="section-title">Snapshots & persistence</p>
+                <p className="muted">
+                  Capture the current text, chunk settings, quality metrics, and retrieval summary so you can reload or compare after a refresh.
+                </p>
               </div>
-            ))}
+            </div>
+            <div className="snapshot-form">
+              <input
+                type="text"
+                placeholder={`e.g. ${activeFileName} baseline`}
+                value={snapshotName}
+                onChange={(e) => {
+                  setSnapshotName(e.target.value);
+                  if (snapshotError) setSnapshotError(null);
+                }}
+              />
+              <button
+                type="button"
+                className="primary-btn"
+                onClick={handleSnapshotSave}
+                disabled={!canSaveSnapshot}
+              >
+                Save snapshot
+              </button>
+            </div>
+            <div className="snapshot-hint">
+              <span className="chip subtle">
+                {snapshots.length ? `${snapshots.length} saved` : "No snapshots yet"}
+              </span>
+              <span className="muted">Stored locally in this browser.</span>
+            </div>
+            {snapshotError && <div className="note warn mini">{snapshotError}</div>}
+            {snapshots.length ? (
+              <div className="snapshot-list">
+                {snapshots.map((snapshot) => {
+                  const variantBadge =
+                    snapshot.id === variantAId
+                      ? "Variant A"
+                      : snapshot.id === variantBId
+                        ? "Variant B"
+                        : null;
+                  const inputLabel = getSnapshotInputLabel(snapshot);
+                  const queryPreview = snapshot.config.retrievalQuery.trim()
+                    ? truncateText(snapshot.config.retrievalQuery.trim(), 80)
+                    : null;
+                  return (
+                    <article key={snapshot.id} className="snapshot-item">
+                      <div className="snapshot-item-head">
+                        <div>
+                          <p className="snapshot-name">{snapshot.name}</p>
+                          <p className="muted snapshot-date">
+                            {formatSnapshotTimestamp(snapshot.createdAt)}
+                          </p>
+                        </div>
+                        <div className="snapshot-tag-group">
+                          {variantBadge && <span className="chip match">{variantBadge}</span>}
+                          <span className="chip subtle">{inputLabel}</span>
+                          <span className="chip subtle">Size {snapshot.config.chunkSize}</span>
+                          <span className="chip subtle">Overlap {snapshot.config.overlap}</span>
+                          <span className="chip subtle">
+                            Sem {snapshot.config.semanticThreshold.toFixed(2)}
+                          </span>
+                        </div>
+                      </div>
+                      <div className="snapshot-meta">
+                        <p>
+                          <span className="meta-label">Chars</span>
+                          {snapshot.summary.workingChars.toLocaleString()}
+                        </p>
+                        <p>
+                          <span className="meta-label">Chunks</span>
+                          MD {snapshot.results.markdown.length} • RC {snapshot.results.recursive.length} • SEM {snapshot.results.semantic.length}
+                        </p>
+                      </div>
+                      <p className={`snapshot-query ${queryPreview ? "" : "muted"}`}>
+                        <span className="meta-label">Query</span>
+                        {queryPreview ? ` “${queryPreview}”` : " None saved"}
+                      </p>
+                      <div className="snapshot-actions">
+                        <button type="button" className="ghost-btn" onClick={() => loadSnapshotById(snapshot.id)}>
+                          Load & activate
+                        </button>
+                        <button
+                          type="button"
+                          className={`pill-btn${variantAId === snapshot.id ? " active" : ""}`}
+                          onClick={() => assignVariant("A", snapshot.id)}
+                        >
+                          {variantAId === snapshot.id ? "Pinned A" : "Set A"}
+                        </button>
+                        <button
+                          type="button"
+                          className={`pill-btn${variantBId === snapshot.id ? " active" : ""}`}
+                          onClick={() => assignVariant("B", snapshot.id)}
+                        >
+                          {variantBId === snapshot.id ? "Pinned B" : "Set B"}
+                        </button>
+                        <button
+                          type="button"
+                          className="text-btn danger"
+                          onClick={() => deleteSnapshot(snapshot.id)}
+                        >
+                          Delete
+                        </button>
+                      </div>
+                    </article>
+                  );
+                })}
+              </div>
+            ) : (
+              <p className="muted empty-copy">
+                Save a snapshot after chunking finishes to persist this configuration and unlock the A/B dashboard.
+              </p>
+            )}
           </div>
-        </div>
-      </section>
+
+          <div className="card ab-card">
+            <div className="panel-head">
+              <div>
+                <p className="section-title">A/B testing board</p>
+                <p className="muted">
+                  Pin two snapshots to compare chunk math, edge cleanliness, and retrieval scores side-by-side.
+                </p>
+              </div>
+            </div>
+            <div className="ab-columns">
+              {renderVariantColumn("A", variantA)}
+              {renderVariantColumn("B", variantB)}
+            </div>
+            <div className="delta-table">
+              <div className="comparison-row heading">
+                <span>Metric</span>
+                <span>Variant A</span>
+                <span>Variant B</span>
+                <span>Δ (A − B)</span>
+              </div>
+              {comparisonRows.map((row) => (
+                <div key={row.label} className="comparison-row">
+                  <span>{row.label}</span>
+                  <span>{row.valueA}</span>
+                  <span>{row.valueB}</span>
+                  <span>{row.delta}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </section></div>)}
 
       <section className="results">
         <div className="column">
           <div className="column-header">
-            <div>
-              <p className="eyebrow">MarkdownTextSplitter</p>
-              <p className="muted">
-                Honors Markdown structure (headers, fences) to keep semantic
-                blocks intact.
-              </p>
+            <div className="column-head-content">
+              <div className="column-title-row">
+                <p className="eyebrow">Markdown</p>
+                <span className="chip subtle">{results.markdown.length} chunks</span>
+              </div>
+              <div className="column-metrics">
+                <div className="metric-pill">
+                  <span className="label">Broken</span>
+                  <span className={`value ${qualityStats.markdown.brokenPercent && qualityStats.markdown.brokenPercent > 0.1 ? 'warn' : 'ok'}`}>
+                    {formatPercentMetric(qualityStats.markdown.brokenPercent)}
+                  </span>
+                </div>
+                <div className="metric-pill">
+                  <span className="label">σ</span>
+                  <span className="value">{formatCharsMetric(qualityStats.markdown.stdDeviation)}</span>
+                </div>
+              </div>
             </div>
             <button
               type="button"
@@ -2128,45 +2327,28 @@ function App() {
               return (
                 <article
                   key={`md-${chunk.id}`}
-                  className={`chunk ${chunk.cleanBoundary ? "clean" : "risky"}${
-                    isRetrieved ? " retrieved" : ""
-                  }`}
-                onMouseEnter={() =>
-                  setFocusRange({
-                    start: chunk.start,
-                    end: chunk.end,
-                    splitter: "markdown",
-                    label: `MD #${chunk.id + 1}`,
-                  })
-                }
-                onMouseLeave={() => setFocusRange(null)}
-                onClick={() =>
-                  setFocusRange({
-                    start: chunk.start,
-                    end: chunk.end,
-                    splitter: "markdown",
-                    label: `MD #${chunk.id + 1}`,
-                  })
-                }
-              >
-                <div className="chunk-meta">
-                  <span className="chip subtle">#{chunk.id + 1}</span>
-                  <span className="chip subtle">
-                    {chunk.charCount.toLocaleString()} chars
-                  </span>
-                  {chunk.lineLabel && (
-                    <span className="chip subtle">{chunk.lineLabel}</span>
-                  )}
-                  <span className={`chip ${chunk.cleanBoundary ? "ok" : "warn"}`}>
-                    {chunk.cleanBoundary ? "Edge looks clean" : "Likely mid-sentence"}
-                  </span>
-                  {retrievalMatches.markdown && (
-                    <span className={`chip ${isRetrieved ? "match" : "subtle"}`}>
-                      {isRetrieved ? "Retrieved" : "Score"} {formatScore(score)}
+                  className={`chunk ${chunk.cleanBoundary ? "clean" : "risky"}${isRetrieved ? " retrieved" : ""
+                    }`}
+
+                >
+                  <div className="chunk-meta">
+                    <span className="chip subtle">#{chunk.id + 1}</span>
+                    <span className="chip subtle">
+                      {chunk.charCount.toLocaleString()} chars
                     </span>
-                  )}
-                </div>
-                <pre>{chunk.content}</pre>
+                    {chunk.lineLabel && (
+                      <span className="chip subtle">{chunk.lineLabel}</span>
+                    )}
+                    <span className={`chip ${chunk.cleanBoundary ? "ok" : "warn"}`}>
+                      {chunk.cleanBoundary ? "Edge looks clean" : "Likely mid-sentence"}
+                    </span>
+                    {retrievalMatches.markdown && (
+                      <span className={`chip ${isRetrieved ? "match" : "subtle"}`}>
+                        {isRetrieved ? "Retrieved" : "Score"} {formatScore(score)}
+                      </span>
+                    )}
+                  </div>
+                  <pre>{chunk.content}</pre>
                 </article>
               );
             })}
@@ -2175,12 +2357,23 @@ function App() {
 
         <div className="column">
           <div className="column-header">
-            <div>
-              <p className="eyebrow">RecursiveCharacterTextSplitter</p>
-              <p className="muted">
-                Splits by separators in order; solid for mixed content but can
-                still slice sentences.
-              </p>
+            <div className="column-head-content">
+              <div className="column-title-row">
+                <p className="eyebrow">Recursive</p>
+                <span className="chip subtle">{results.recursive.length} chunks</span>
+              </div>
+              <div className="column-metrics">
+                <div className="metric-pill">
+                  <span className="label">Broken</span>
+                  <span className={`value ${qualityStats.recursive.brokenPercent && qualityStats.recursive.brokenPercent > 0.1 ? 'warn' : 'ok'}`}>
+                    {formatPercentMetric(qualityStats.recursive.brokenPercent)}
+                  </span>
+                </div>
+                <div className="metric-pill">
+                  <span className="label">σ</span>
+                  <span className="value">{formatCharsMetric(qualityStats.recursive.stdDeviation)}</span>
+                </div>
+              </div>
             </div>
             <button
               type="button"
@@ -2203,45 +2396,28 @@ function App() {
               return (
                 <article
                   key={`rc-${chunk.id}`}
-                  className={`chunk ${chunk.cleanBoundary ? "clean" : "risky"}${
-                    isRetrieved ? " retrieved" : ""
-                  }`}
-                onMouseEnter={() =>
-                  setFocusRange({
-                    start: chunk.start,
-                    end: chunk.end,
-                    splitter: "recursive",
-                    label: `RC #${chunk.id + 1}`,
-                  })
-                }
-                onMouseLeave={() => setFocusRange(null)}
-                onClick={() =>
-                  setFocusRange({
-                    start: chunk.start,
-                    end: chunk.end,
-                    splitter: "recursive",
-                    label: `RC #${chunk.id + 1}`,
-                  })
-                }
-              >
-                <div className="chunk-meta">
-                  <span className="chip subtle">#{chunk.id + 1}</span>
-                  <span className="chip subtle">
-                    {chunk.charCount.toLocaleString()} chars
-                  </span>
-                  {chunk.lineLabel && (
-                    <span className="chip subtle">{chunk.lineLabel}</span>
-                  )}
-                  <span className={`chip ${chunk.cleanBoundary ? "ok" : "warn"}`}>
-                    {chunk.cleanBoundary ? "Edge looks clean" : "Likely mid-sentence"}
-                  </span>
-                  {retrievalMatches.recursive && (
-                    <span className={`chip ${isRetrieved ? "match" : "subtle"}`}>
-                      {isRetrieved ? "Retrieved" : "Score"} {formatScore(score)}
+                  className={`chunk ${chunk.cleanBoundary ? "clean" : "risky"}${isRetrieved ? " retrieved" : ""
+                    }`}
+
+                >
+                  <div className="chunk-meta">
+                    <span className="chip subtle">#{chunk.id + 1}</span>
+                    <span className="chip subtle">
+                      {chunk.charCount.toLocaleString()} chars
                     </span>
-                  )}
-                </div>
-                <pre>{chunk.content}</pre>
+                    {chunk.lineLabel && (
+                      <span className="chip subtle">{chunk.lineLabel}</span>
+                    )}
+                    <span className={`chip ${chunk.cleanBoundary ? "ok" : "warn"}`}>
+                      {chunk.cleanBoundary ? "Edge looks clean" : "Likely mid-sentence"}
+                    </span>
+                    {retrievalMatches.recursive && (
+                      <span className={`chip ${isRetrieved ? "match" : "subtle"}`}>
+                        {isRetrieved ? "Retrieved" : "Score"} {formatScore(score)}
+                      </span>
+                    )}
+                  </div>
+                  <pre>{chunk.content}</pre>
                 </article>
               );
             })}
@@ -2250,12 +2426,23 @@ function App() {
 
         <div className="column">
           <div className="column-header">
-            <div>
-              <p className="eyebrow">Semantic embeddings</p>
-              <p className="muted">
-                Adjacent sentences stay together only when their MiniLM vectors
-                stay similar; great for topic-driven slices.
-              </p>
+            <div className="column-head-content">
+              <div className="column-title-row">
+                <p className="eyebrow">Semantic</p>
+                <span className="chip subtle">{results.semantic.length} chunks</span>
+              </div>
+              <div className="column-metrics">
+                <div className="metric-pill">
+                  <span className="label">Broken</span>
+                  <span className={`value ${qualityStats.semantic.brokenPercent && qualityStats.semantic.brokenPercent > 0.1 ? 'warn' : 'ok'}`}>
+                    {formatPercentMetric(qualityStats.semantic.brokenPercent)}
+                  </span>
+                </div>
+                <div className="metric-pill">
+                  <span className="label">σ</span>
+                  <span className="value">{formatCharsMetric(qualityStats.semantic.stdDeviation)}</span>
+                </div>
+              </div>
             </div>
             <button
               type="button"
@@ -2284,45 +2471,28 @@ function App() {
               return (
                 <article
                   key={`sem-${chunk.id}`}
-                  className={`chunk ${chunk.cleanBoundary ? "clean" : "risky"}${
-                    isRetrieved ? " retrieved" : ""
-                  }`}
-                onMouseEnter={() =>
-                  setFocusRange({
-                    start: chunk.start,
-                    end: chunk.end,
-                    splitter: "semantic",
-                    label: `SEM #${chunk.id + 1}`,
-                  })
-                }
-                onMouseLeave={() => setFocusRange(null)}
-                onClick={() =>
-                  setFocusRange({
-                    start: chunk.start,
-                    end: chunk.end,
-                    splitter: "semantic",
-                    label: `SEM #${chunk.id + 1}`,
-                  })
-                }
-              >
-                <div className="chunk-meta">
-                  <span className="chip subtle">#{chunk.id + 1}</span>
-                  <span className="chip subtle">
-                    {chunk.charCount.toLocaleString()} chars
-                  </span>
-                  {chunk.lineLabel && (
-                    <span className="chip subtle">{chunk.lineLabel}</span>
-                  )}
-                  <span className={`chip ${chunk.cleanBoundary ? "ok" : "warn"}`}>
-                    {chunk.cleanBoundary ? "Edge looks clean" : "Likely mid-sentence"}
-                  </span>
-                  {retrievalMatches.semantic && (
-                    <span className={`chip ${isRetrieved ? "match" : "subtle"}`}>
-                      {isRetrieved ? "Retrieved" : "Score"} {formatScore(score)}
+                  className={`chunk ${chunk.cleanBoundary ? "clean" : "risky"}${isRetrieved ? " retrieved" : ""
+                    }`}
+
+                >
+                  <div className="chunk-meta">
+                    <span className="chip subtle">#{chunk.id + 1}</span>
+                    <span className="chip subtle">
+                      {chunk.charCount.toLocaleString()} chars
                     </span>
-                  )}
-                </div>
-                <pre>{chunk.content}</pre>
+                    {chunk.lineLabel && (
+                      <span className="chip subtle">{chunk.lineLabel}</span>
+                    )}
+                    <span className={`chip ${chunk.cleanBoundary ? "ok" : "warn"}`}>
+                      {chunk.cleanBoundary ? "Edge looks clean" : "Likely mid-sentence"}
+                    </span>
+                    {retrievalMatches.semantic && (
+                      <span className={`chip ${isRetrieved ? "match" : "subtle"}`}>
+                        {isRetrieved ? "Retrieved" : "Score"} {formatScore(score)}
+                      </span>
+                    )}
+                  </div>
+                  <pre>{chunk.content}</pre>
                 </article>
               );
             })}
@@ -2330,8 +2500,313 @@ function App() {
         </div>
       </section>
 
+      {
+        showEvalsModal && evaluationMetrics && (
+          <div className="modal-overlay" onClick={() => setShowEvalsModal(false)}>
+            <div className="modal-content" onClick={(e) => e.stopPropagation()}>
+              <div className="modal-header">
+                <h2>Evaluation Results</h2>
+                <button
+                  type="button"
+                  className="close-btn"
+                  onClick={() => setShowEvalsModal(false)}
+                  aria-label="Close modal"
+                >
+                  ✕
+                </button>
+              </div>
+
+              <div className="modal-body">
+                {/* Metrics Overview */}
+                <section className="metrics-overview">
+                  <h3>Comparative Metrics</h3>
+                  <div className="metrics-table">
+                    <div className="metrics-header">
+                      <div className="metric-cell">Metric</div>
+                      <div className="metric-cell">Markdown</div>
+                      <div className="metric-cell">Recursive</div>
+                      <div className="metric-cell">Semantic</div>
+                      <div className="metric-cell">Winner</div>
+                    </div>
+
+                    {(["hitRate", "mrr", "precision", "recall"] as const).map((metricKey) => {
+                      const bestStrategy = getBestStrategy(evaluationMetrics, metricKey);
+                      const metricLabels = {
+                        hitRate: "Hit Rate",
+                        mrr: "Mean Reciprocal Rank",
+                        precision: "Precision",
+                        recall: "Recall",
+                      };
+
+                      return (
+                        <div key={metricKey} className="metrics-row">
+                          <div className="metric-cell metric-label">
+                            {metricLabels[metricKey]}
+                          </div>
+                          {(["markdown", "recursive", "semantic"] as const).map((strategy) => {
+                            const value = evaluationMetrics[strategy][metricKey];
+                            const isBest = strategy === bestStrategy;
+                            const displayType = metricKey === "mrr" ? "decimal" : "percentage";
+
+                            return (
+                              <div
+                                key={strategy}
+                                className={`metric-cell ${isBest ? "best" : ""}`}
+                              >
+                                {formatMetric(value, displayType)}
+                              </div>
+                            );
+                          })}
+                          <div className="metric-cell winner-cell">
+                            {bestStrategy && (
+                              <span className="chip ok">
+                                {SPLITTER_LABELS[bestStrategy]}
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  <div className="metrics-explanation">
+                    <p className="muted">
+                      <strong>Hit Rate:</strong> % of questions where the answer was found in top-{RETRIEVAL_TOP_K} chunks.{" "}
+                      <strong>MRR:</strong> Mean reciprocal rank of first correct answer (higher = found earlier).{" "}
+                      <strong>Precision:</strong> % of retrieved chunks that were relevant.{" "}
+                      <strong>Recall:</strong> % of relevant chunks that were retrieved.
+                    </p>
+                  </div>
+                </section>
+
+                {/* Visual Comparison */}
+                <section className="metrics-visualization">
+                  <h3>Performance Comparison</h3>
+                  <div className="bar-chart">
+                    {(["hitRate", "mrr", "precision", "recall"] as const).map((metricKey) => {
+                      const metricLabels = {
+                        hitRate: "Hit Rate",
+                        mrr: "MRR",
+                        precision: "Precision",
+                        recall: "Recall",
+                      };
+
+                      const maxValue = metricKey === "mrr" ? 1 : 1; // All metrics are 0-1
+                      const markdownValue = evaluationMetrics.markdown[metricKey];
+                      const recursiveValue = evaluationMetrics.recursive[metricKey];
+                      const semanticValue = evaluationMetrics.semantic[metricKey];
+
+                      return (
+                        <div key={metricKey} className="bar-group">
+                          <div className="bar-label">{metricLabels[metricKey]}</div>
+                          <div className="bars">
+                            <div className="bar-stack">
+                              <span className="bar-strategy-label">MD</span>
+                              <div
+                                className="bar markdown-bar"
+                                style={{ width: `${(markdownValue / maxValue) * 100}%` }}
+                                title={`Markdown: ${formatMetric(markdownValue, metricKey === "mrr" ? "decimal" : "percentage")}`}
+                              >
+                                <span className="bar-value">
+                                  {formatMetric(markdownValue, metricKey === "mrr" ? "decimal" : "percentage")}
+                                </span>
+                              </div>
+                            </div>
+                            <div className="bar-stack">
+                              <span className="bar-strategy-label">RC</span>
+                              <div
+                                className="bar recursive-bar"
+                                style={{ width: `${(recursiveValue / maxValue) * 100}%` }}
+                                title={`Recursive: ${formatMetric(recursiveValue, metricKey === "mrr" ? "decimal" : "percentage")}`}
+                              >
+                                <span className="bar-value">
+                                  {formatMetric(recursiveValue, metricKey === "mrr" ? "decimal" : "percentage")}
+                                </span>
+                              </div>
+                            </div>
+                            <div className="bar-stack">
+                              <span className="bar-strategy-label">SM</span>
+                              <div
+                                className="bar semantic-bar"
+                                style={{ width: `${(semanticValue / maxValue) * 100}%` }}
+                                title={`Semantic: ${formatMetric(semanticValue, metricKey === "mrr" ? "decimal" : "percentage")}`}
+                              >
+                                <span className="bar-value">
+                                  {formatMetric(semanticValue, metricKey === "mrr" ? "decimal" : "percentage")}
+                                </span>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </section>
+
+                {/* Per-Question Breakdown */}
+                <section className="question-breakdown">
+                  <h3>Per-Question Results</h3>
+                  <div className="question-table">
+                    <div className="question-header">
+                      <div className="question-cell">Question</div>
+                      <div className="question-cell">Markdown</div>
+                      <div className="question-cell">Recursive</div>
+                      <div className="question-cell">Semantic</div>
+                    </div>
+
+                    {evaluationResults.map((result) => (
+                      <div key={result.questionId} className="question-row">
+                        <div className="question-cell question-text">
+                          <strong>{result.question}</strong>
+                          <br />
+                          <span className="muted answer-snippet">
+                            Expected: {result.answerSnippet.slice(0, 80)}
+                            {result.answerSnippet.length > 80 ? "..." : ""}
+                          </span>
+                        </div>
+                        {(["markdown", "recursive", "semantic"] as const).map((strategy) => {
+                          const strategyResult = result.results[strategy];
+                          const found = strategyResult.found;
+                          const rank = strategyResult.rank;
+
+                          return (
+                            <div
+                              key={strategy}
+                              className={`question-cell ${found ? "found" : "not-found"}`}
+                            >
+                              {found ? (
+                                <>
+                                  <span className="chip ok">✓ Found</span>
+                                  <span className="muted">Rank #{rank}</span>
+                                </>
+                              ) : (
+                                <span className="chip warn">✗ Not Found</span>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    ))}
+                  </div>
+                </section>
+              </div>
+
+              <div className="modal-footer">
+                <button
+                  type="button"
+                  className="secondary-btn"
+                  onClick={() => {
+                    const exportData = {
+                      goldStandard: goldStandardPairs,
+                      evaluationResults,
+                      evaluationMetrics,
+                      config: { chunkSize, overlap, semanticThreshold },
+                      timestamp: new Date().toISOString(),
+                    };
+                    const blob = new Blob([JSON.stringify(exportData, null, 2)], {
+                      type: "application/json",
+                    });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement("a");
+                    a.href = url;
+                    a.download = `evaluation-results-${Date.now()}.json`;
+                    a.click();
+                    URL.revokeObjectURL(url);
+                  }}
+                >
+                  Export JSON
+                </button>
+                <button
+                  type="button"
+                  className="primary-btn"
+                  onClick={() => setShowEvalsModal(false)}
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+          </div>
+        )
+      }
+
+      {showHelpModal && (
+        <div className="modal-overlay" onClick={() => setShowHelpModal(false)}>
+          <div className="modal-content large" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <h2>Help & Documentation</h2>
+              <button
+                className="close-btn"
+                onClick={() => setShowHelpModal(false)}
+                aria-label="Close modal"
+              >
+                ×
+              </button>
+            </div>
+            <div className="modal-body">
+              <section className="docs-links">
+                <p className="section-title">Docs & case studies</p>
+                <div className="doc-link-grid">
+                  {DOC_LINKS.map((link) => (
+                    <a
+                      key={link.id}
+                      href={link.href}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="doc-link"
+                    >
+                      <span className="chip subtle">{link.badge}</span>
+                      <strong>{link.title}</strong>
+                      <p>{link.description}</p>
+                    </a>
+                  ))}
+                </div>
+              </section>
+
+              <section className="insights">
+                <div className="insights-card">
+                  <p className="section-title">Field guide: 7 chunking plays</p>
+                  <p className="muted">
+                    Cheat sheet for matching text splitters to document types.
+                  </p>
+                  <div className="insight-grid">
+                    {ARTICLE_INSIGHTS.map((insight) => (
+                      <div key={insight.id} className="insight">
+                        <div className="insight-head">
+                          <span className="chip subtle">{insight.id}</span>
+                          <h3>{insight.title}</h3>
+                        </div>
+                        <p className="insight-summary">{insight.summary}</p>
+                        <div className="insight-meta">
+                          <div>
+                            <span className="meta-label">Best for</span>
+                            <p>{insight.bestFor}</p>
+                          </div>
+                          <div>
+                            <span className="meta-label">Watch for</span>
+                            <p>{insight.watchFor}</p>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </section>
+            </div>
+            <div className="modal-footer">
+              <button
+                type="button"
+                className="primary-btn"
+                onClick={() => setShowHelpModal(false)}
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {isLoading && <div className="loading">Re-chunking…</div>}
-    </div>
+    </div >
   );
 }
 
